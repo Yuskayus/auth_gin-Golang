@@ -14,6 +14,7 @@ func SetupRouter() *gin.Engine {
 	r.POST("/register", controllers.Register)
 	r.POST("/login", controllers.Login)
 	r.POST("/refresh", controllers.RefreshToken)
+	r.POST("/logout", controllers.Logout)
 
 	// Endpoint yang membutuhkan autentikasi
 	auth := r.Group("/")
