@@ -14,6 +14,35 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+// Generate Access Token & Refresh Token
+func generateToken(userID int, role string) (string, string, error) {
+	// Access Token (15 menit)
+	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"role":    role,
+		"exp":     time.Now().Add(15 * time.Minute).Unix(),
+	})
+
+	accessTokenString, err := accessToken.SignedString([]byte(os.Getenv("JWT_SECRET")))
+	if err != nil {
+		return "", "", err
+	}
+
+	// Refresh Token (7 hari)
+	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(7 * 24 * time.Hour).Unix(),
+	})
+
+	refreshTokenString, err := refreshToken.SignedString([]byte(os.Getenv("JWT_SECRET")))
+	if err != nil {
+		return "", "", err
+	}
+
+	return accessTokenString, refreshTokenString, nil
+}
+
+// Register User
 func Register(c *gin.Context) {
 	var user models.User
 	if err := c.ShouldBindJSON(&user); err != nil {
@@ -27,7 +56,7 @@ func Register(c *gin.Context) {
 		return
 	}
 
-	_, err = config.DB.Exec("INSERT INTO users (username, password) VALUES ($1, $2)", user.Username, string(hashedPassword))
+	_, err = config.DB.Exec("INSERT INTO users (username, password, role) VALUES ($1, $2, $3)", user.Username, string(hashedPassword), "user")
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to register user"})
 		return
@@ -36,6 +65,7 @@ func Register(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "User registered successfully"})
 }
 
+// Login User
 func Login(c *gin.Context) {
 	var user models.User
 	if err := c.ShouldBindJSON(&user); err != nil {
@@ -44,7 +74,9 @@ func Login(c *gin.Context) {
 	}
 
 	var storedUser models.User
-	err := config.DB.QueryRow("SELECT id, username, password FROM users WHERE username = $1", user.Username).Scan(&storedUser.ID, &storedUser.Username, &storedUser.Password)
+	err := config.DB.QueryRow("SELECT id, username, password, role FROM users WHERE username = $1", user.Username).Scan(
+		&storedUser.ID, &storedUser.Username, &storedUser.Password, &storedUser.Role,
+	)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 		return
@@ -59,16 +91,73 @@ func Login(c *gin.Context) {
 		return
 	}
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": storedUser.ID,
-		"exp":     time.Now().Add(time.Hour * 24).Unix(),
-	})
-
-	tokenString, err := token.SignedString([]byte(os.Getenv("JWT_SECRET")))
+	// Generate tokens
+	accessToken, refreshToken, err := generateToken(storedUser.ID, storedUser.Role)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not generate token"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not generate tokens"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"token": tokenString})
+	// Simpan refresh token ke database
+	_, err = config.DB.Exec("UPDATE users SET refresh_token = $1 WHERE id = $2", refreshToken, storedUser.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save refresh token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  accessToken,
+		"refresh_token": refreshToken,
+	})
+}
+
+// Refresh Token
+func RefreshToken(c *gin.Context) {
+	var requestBody struct {
+		RefreshToken string `json:"refresh_token"`
+	}
+	if err := c.ShouldBindJSON(&requestBody); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+		return
+	}
+
+	// Validasi refresh token
+	token, err := jwt.Parse(requestBody.RefreshToken, func(token *jwt.Token) (interface{}, error) {
+		return []byte(os.Getenv("JWT_SECRET")), nil
+	})
+	if err != nil || !token.Valid {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid refresh token"})
+		return
+	}
+
+	claims, _ := token.Claims.(jwt.MapClaims)
+	userID := int(claims["user_id"].(float64))
+
+	// Cek refresh token di database
+	var storedRefreshToken string
+	var role string
+	err = config.DB.QueryRow("SELECT refresh_token, role FROM users WHERE id = $1", userID).Scan(&storedRefreshToken, &role)
+	if err != nil || storedRefreshToken != requestBody.RefreshToken {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Refresh token mismatch"})
+		return
+	}
+
+	// Generate tokens baru
+	accessToken, newRefreshToken, err := generateToken(userID, role)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Could not generate new tokens"})
+		return
+	}
+
+	// Simpan refresh token baru ke database
+	_, err = config.DB.Exec("UPDATE users SET refresh_token = $1 WHERE id = $2", newRefreshToken, userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save refresh token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"access_token":  accessToken,
+		"refresh_token": newRefreshToken,
+	})
 }
